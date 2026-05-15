@@ -31,8 +31,8 @@ bash scripts/abc/run_qual_free.sh
 ```
 
 By default, `run_qual_free.sh` runs the prompt
-`Pikachu in the style of The Simpsons` and produces separate qualitative
-attribution results for `Pikachu` and `The Simpsons`.
+`Pikachu in the style of Pablo Picasso` and produces separate qualitative
+attribution results for `Pikachu` and `Pablo Picasso`.
 
 ---
 
@@ -126,8 +126,8 @@ bash scripts/abc/run_qual_free.sh
 Default configuration:
 
 ```text
-PROMPT="Pikachu in the style of The Simpsons"
-TARGET_CONCEPTS="Pikachu,The Simpsons"
+PROMPT="Pikachu in the style of Pablo Picasso"
+TARGET_CONCEPTS="Pikachu,Pablo Picasso"
 SEED=0
 GPU_ID=4
 ```
@@ -136,8 +136,8 @@ For the default composition, the script uses the complementary prompt as the
 negative prompt:
 
 ```text
-target=Pikachu      -> negative_prompt="in the style of The Simpsons"
-target=The Simpsons -> negative_prompt="Pikachu"
+target=Pikachu       -> negative_prompt="in the style of Pablo Picasso"
+target=Pablo Picasso -> negative_prompt="Pikachu"
 ```
 
 Results are saved under:
@@ -149,8 +149,8 @@ experiments/abc/results/qual/free_query/
 Each target concept gets its own directory, for example:
 
 ```text
-pikachu-in-the-style-of-the-simpsons-...-target_pikachu-...
-pikachu-in-the-style-of-the-simpsons-...-target_the-simpsons-...
+pikachu-in-the-style-of-pablo-picasso-...-target_pikachu-...
+pikachu-in-the-style-of-pablo-picasso-...-target_pablo-picasso-...
 ```
 
 Each directory contains:
