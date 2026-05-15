@@ -20,6 +20,41 @@ def seed_everything(seed: int):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
+
+
+OBJECTIVE_ALIASES = {
+    'dsm': 'dsm',
+    'ttrakv1': 'dsm',
+    'dtrak': 'dtrak',
+    'dtrakv1': 'dtrak',
+    'das': 'das',
+    'dasv1': 'das',
+    'dps': 'dps',
+    'dpsv1': 'dps',
+}
+
+
+def normalize_objective_name(name: str) -> str:
+    try:
+        return OBJECTIVE_ALIASES[name]
+    except KeyError as exc:
+        valid = ', '.join(sorted(set(OBJECTIVE_ALIASES.values())))
+        raise ValueError(f'Invalid objective: {name}. Use one of: {valid}') from exc
+
+
+def make_random_project_func(feature_dim, proj_dim, proj_max_batch_size, device, proj_type='random_mask', proj_seed=0):
+    from dattri.func.projection import random_project
+
+    sample_feature = torch.empty(1, feature_dim, device=device, dtype=torch.float32)
+    return random_project(
+        sample_feature,
+        1,
+        proj_dim=proj_dim,
+        proj_max_batch_size=proj_max_batch_size,
+        proj_seed=proj_seed,
+        proj_type=proj_type,
+        device=device,
+    )
     
 # ------------------------------------
 # DPS

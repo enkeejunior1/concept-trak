@@ -11,7 +11,7 @@ from einops import einsum
 import numpy as np
 import torch
 import torch.nn.functional as F
-from utils import ExemplarDataset, seed_everything, get_dps_guidance
+from utils import ExemplarDataset, seed_everything, get_dps_guidance, make_random_project_func, normalize_objective_name
 
 def flush():
     torch.cuda.empty_cache()
@@ -34,9 +34,15 @@ def arg_parser():
     parser.add_argument('--NFE', type=int, default=10)
     parser.add_argument('--dtype', type=str, default='fp32')
     parser.add_argument('--batch_size', type=int, default=2)
+    parser.add_argument('--proj_type', type=str, default='random_mask')
     parser.add_argument('--guidance_scale', type=float, default=1.0, required=False)
     parser.add_argument('--output_dir', type=str, default=str(experiment_dir / 'results' / 'grads'))
-    parser.add_argument('--sd_model_path', type=str, default='/home/yonghyun.park/.cache/huggingface/hub/models--CompVis--stable-diffusion-v1-4/snapshots/133a221b8aa7292a167afc5127cb63fb5005638b')
+    parser.add_argument(
+        '--sd_model_path',
+        type=str,
+        default='CompVis/stable-diffusion-v1-4',
+        help='HF repo id or local snapshot directory.',
+    )
     parser.add_argument('--data_dir', type=str, default=str(experiment_dir / 'data'))
     parser.add_argument('--task_json', type=str, default=str(experiment_dir / 'configs' / 'all_tasks.json'))
     return parser.parse_args()
@@ -47,6 +53,7 @@ if __name__ == "__main__":
     # Args
     # ------------------------------------------------------------
     args = arg_parser()
+    objective = normalize_objective_name(args.f)
     sd_version = args.sd_model_path
     data_path = args.data_dir
     task_json = args.task_json
@@ -54,13 +61,13 @@ if __name__ == "__main__":
     
     # Args (global)
     device = 'cuda'
-    dtype = torch.float16 
+    dtype = torch.float16 if args.dtype == 'fp16' else torch.float32
     loss_rescale = 1e4 
 
     # ------------------------------------------------------------
     # setting 
     # ------------------------------------------------------------
-    save_path = f'{args.output_dir}/{args.layer}-{args.f}-NFE{args.NFE}'
+    save_path = f'{args.output_dir}/{args.layer}-{objective}-NFE{args.NFE}'
     if args.normalize:
         save_path += '-norm'
     if args.ddim_inversion:
@@ -68,6 +75,9 @@ if __name__ == "__main__":
     save_path = Path(save_path)
     feature_path = f'{save_path}/task_grad-{args.task_idx}.npy'
     os.makedirs(save_path, exist_ok=True)
+    save_loss = objective == 'das'
+    if save_loss:
+        loss_path = f'{save_path}/task_loss-{args.task_idx}.npy'
 
     # load task json 
     with open(task_json, 'r') as f:
@@ -115,11 +125,12 @@ if __name__ == "__main__":
     # ------------------------------------------------------------
     # setting: TRAK
     # ------------------------------------------------------------
-    from dattri.func.projection import random_project
-    project_func = random_project(
-        torch.randn(count_parameters(unet), device=device), 
-        count_parameters(unet), 
-        proj_max_batch_size=16, proj_dim=proj_dim, device=device
+    project_func = make_random_project_func(
+        count_parameters(unet),
+        proj_dim=proj_dim,
+        proj_max_batch_size=16,
+        proj_type=args.proj_type,
+        device=device,
     )
 
     # ------------------------------------------------------------
@@ -129,28 +140,28 @@ if __name__ == "__main__":
     params = {k: v.detach() for k, v in unet.named_parameters() if v.requires_grad==True}
     buffers = {k: v.detach() for k, v in unet.named_buffers() if v.requires_grad==True}
 
-    if args.f == 'dtrakv1':
+    if objective == 'dtrak':
         def compute_f(params, buffers, xt, t, noise, p_emb_):
             xt, t, noise, p_emb_ = xt.unsqueeze(0), t.unsqueeze(0), noise.unsqueeze(0), p_emb_.unsqueeze(0)
             et = functional_call(unet, (params, buffers), args=xt, kwargs={'timestep': t, 'encoder_hidden_states': p_emb_})
             et = et.sample
             f = F.mse_loss(torch.zeros_like(noise), et, reduction="none").mean(dim=(1,2,3)).sum()
             return loss_rescale * f
-    elif args.f == 'ttrakv1': # exactly same as L_dsm
+    elif objective == 'dsm':
         def compute_f(params, buffers, xt, t, noise, p_emb_):
             xt, t, noise, p_emb_ = xt.unsqueeze(0), t.unsqueeze(0), noise.unsqueeze(0), p_emb_.unsqueeze(0)
             et = functional_call(unet, (params, buffers), args=xt, kwargs={'timestep': t, 'encoder_hidden_states': p_emb_})
             et = et.sample
             f = F.mse_loss(noise, et, reduction="none").mean(dim=(1,2,3)).sum()
             return loss_rescale * f
-    elif args.f == 'dpsv1':
+    elif objective == 'dps':
         def compute_f(params, buffers, xt, t, guidance, p_emb_):
             xt, t, guidance, p_emb_ = xt.unsqueeze(0), t.unsqueeze(0), guidance.unsqueeze(0), p_emb_.unsqueeze(0)
             et = functional_call(unet, (params, buffers), args=xt, kwargs={'timestep': t, 'encoder_hidden_states': p_emb_})
             et = et.sample
             f = F.mse_loss((et + guidance).detach(), et, reduction="none").mean(dim=(1,2,3)).sum() 
             return loss_rescale * f
-    elif args.f == 'dasv1': 
+    elif objective == 'das':
         def compute_f(params, buffers, xt, t, noise, p_emb_):
             xt, t, noise, p_emb_ = xt.unsqueeze(0), t.unsqueeze(0), noise.unsqueeze(0), p_emb_.unsqueeze(0)
             et = functional_call(unet, (params, buffers), args=xt, kwargs={'timestep': t, 'encoder_hidden_states': p_emb_})
@@ -158,7 +169,7 @@ if __name__ == "__main__":
             f = F.l1_loss(torch.zeros_like(noise), et, reduction="none").mean(dim=(1,2,3)).sum()
             return loss_rescale * f
     else:
-        raise ValueError(f'Invalid f: {args.f}')
+        raise ValueError(f'Invalid f: {objective}')
 
     ft_compute_grad = grad(compute_f)
     ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, None, 0, 0, 0, 0))
@@ -186,6 +197,8 @@ if __name__ == "__main__":
     # compute train grad (DSM Loss)
     # ------------------------------------------------------------
     dstore_keys = np.memmap(feature_path, dtype=np.float32, mode='w+', shape=(len(train_ds), proj_dim))
+    if save_loss:
+        dstore_loss = np.memmap(loss_path, dtype=np.float32, mode='w+', shape=(len(train_ds)))
 
     # precompute timesteps needed for forward pass
     selected_timesteps = torch.arange(1000 // args.NFE, 1000, 1000 // args.NFE, device=device)
@@ -227,7 +240,7 @@ if __name__ == "__main__":
 
         # Compute gradients
         for index_t, (t, noise, xt) in enumerate(zip(t_list, noise_list, xt_list)):
-            if 'dps' in args.f:
+            if objective == 'dps':
                 alpha_prod_t = pipe.scheduler.alphas_cumprod[t[0].item()].item()
                 guidance = get_dps_guidance(unet, xt, p_emb, t, x0, alpha_prod_t).detach()
                 f_args = (params, buffers, xt, t, guidance, p_emb)
@@ -249,6 +262,15 @@ if __name__ == "__main__":
                 emb = ft_per_sample_grads
             else:
                 emb += ft_per_sample_grads
+
+            if save_loss:
+                with torch.no_grad():
+                    et = unet(xt, t, p_emb).sample
+                    loss_t = F.mse_loss(noise, et, reduction="none").mean(dim=(1,2,3))
+                if index_t == 0:
+                    sample_loss = loss_t
+                else:
+                    sample_loss += loss_t
         
         if sample_idx == 0:
             print(emb[0])
@@ -259,7 +281,11 @@ if __name__ == "__main__":
 
         emb = project_func(emb.float())
         dstore_keys[sample_idx:sample_idx+num_samples] = emb.cpu().numpy()
+        if save_loss:
+            dstore_loss[sample_idx:sample_idx+num_samples] = sample_loss.cpu().numpy()
         sample_idx += num_samples
         
         del emb
+        if save_loss:
+            del sample_loss
         flush()

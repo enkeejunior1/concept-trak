@@ -1,7 +1,9 @@
 import argparse
 import gc
+import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -13,7 +15,7 @@ from einops import einsum
 from PIL import Image
 from tqdm import tqdm
 
-from utils import ExemplarVisDataset, LAIONVisDataset, seed_everything
+from utils import ExemplarVisDataset, LAIONVisDataset, make_random_project_func, normalize_objective_name, seed_everything
 
 
 def flush():
@@ -57,9 +59,14 @@ def reverse_process(
 def arg_parser():
     experiment_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task_idx", type=int, required=True)
+    parser.add_argument("--task_idx", type=int, default=None)
+    parser.add_argument("--prompt", type=str, default=None)
+    parser.add_argument("--negative_prompt", type=str, default=None)
+    parser.add_argument("--target_concept", type=str, default=None)
+    parser.add_argument("--ti_model_path", type=str, default=None)
+    parser.add_argument("--ti_weight_name", type=str, default="new1.bin")
     parser.add_argument("--layer", type=str, required=True)
-    parser.add_argument("--f", type=str, default="dpsv1")
+    parser.add_argument("--f", type=str, default="dps")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--normalize", action="store_true")
     parser.add_argument("--ddim_inversion", action="store_true")
@@ -67,6 +74,7 @@ def arg_parser():
     parser.add_argument("--dtype", type=str, default="fp16")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=256)
+    parser.add_argument("--proj_type", type=str, default="random_mask")
     parser.add_argument("--num_split", type=int, default=8)
     parser.add_argument("--top_k", type=int, default=10)
     parser.add_argument("--train_guidance_scale", type=float, default=7.5)
@@ -81,8 +89,9 @@ def arg_parser():
     parser.add_argument(
         "--sd_model_path",
         type=str,
-        default="/home/yonghyun.park/.cache/huggingface/hub/models--CompVis--stable-diffusion-v1-4/snapshots/133a221b8aa7292a167afc5127cb63fb5005638b",
+        default="CompVis/stable-diffusion-v1-4",
     )
+    parser.add_argument("--force_recompute_concept_grad", action="store_true")
     parser.add_argument("--render_leastk", action="store_true")
     return parser.parse_args()
 
@@ -108,15 +117,11 @@ def build_grad_dir(base_dir, layer, name, nfe, normalize=False, ddim_inversion=F
     return path
 
 
-def build_loss_dir(base_dir, nfe):
-    return Path(base_dir) / f"loss-NFE{nfe}"
-
-
 def build_output_dir(args, seed):
     out_dir = Path(args.results_dir) / f"task_{args.task_idx}" / (
-        f"{args.layer}-{args.f}-slider_seed"
+        f"{args.layer}-{args.f}-test_grad"
         f"-train_gs_{args.train_guidance_scale}"
-        f"-concept_gs_{args.concept_guidance_scale}"
+        f"-test_gs_{args.concept_guidance_scale}"
         f"-eta_{args.eta}"
         f"-seed_{seed}"
     )
@@ -125,6 +130,51 @@ def build_output_dir(args, seed):
     if args.ddim_inversion:
         out_dir = Path(f"{out_dir}-ddim")
     return out_dir
+
+
+def slugify_prompt(prompt, max_len=48):
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", prompt.lower()).strip("-")
+    return (slug[:max_len].strip("-") or "prompt")
+
+
+def build_free_output_dir(args, seed):
+    prompt_hash = hashlib.sha1(args.prompt.encode("utf-8")).hexdigest()[:10]
+    prompt_slug = slugify_prompt(args.prompt)
+    target_suffix = ""
+    if args.target_concept:
+        target_suffix = f"-target_{slugify_prompt(args.target_concept, max_len=32)}"
+    out_dir = Path(args.results_dir) / "free_query" / (
+        f"{prompt_slug}-{prompt_hash}"
+        f"{target_suffix}"
+        f"-{args.layer}-{args.f}"
+        f"-train_gs_{args.train_guidance_scale}"
+        f"-test_gs_{args.concept_guidance_scale}"
+        f"-eta_{args.eta}"
+        f"-seed_{seed}"
+    )
+    if args.normalize:
+        out_dir = Path(f"{out_dir}-norm")
+    if args.ddim_inversion:
+        out_dir = Path(f"{out_dir}-ddim")
+    return out_dir
+
+
+def cache_matches(meta_path, expected_meta):
+    if not meta_path.exists():
+        return False
+    try:
+        meta = torch.load(meta_path, map_location="cpu")
+    except Exception:
+        return False
+    for key, value in expected_meta.items():
+        if key == "concept_args":
+            continue
+        if meta.get(key) != value:
+            return False
+    existing_concept_args = meta.get("concept_args")
+    if existing_concept_args is None:
+        return True
+    return existing_concept_args == expected_meta.get("concept_args")
 
 
 def render_grid(indices, scores, exemplar_ds, train_ds, num_exemplars, save_path):
@@ -174,15 +224,16 @@ def encode_prompts(pipe, prompts, device):
 
 def generate_query_artifacts(pipe, prompt, seed, device, dtype, out_dir, num_steps, guidance_scale):
     generator = torch.Generator(device=device).manual_seed(seed)
-    xT = torch.randn(1, 4, 64, 64, generator=generator, device=device, dtype=dtype)
-    xT = xT * pipe.scheduler.init_noise_sigma
+    raw_noise = torch.randn(1, 4, 64, 64, generator=generator, device=device, dtype=dtype)
+    xT = raw_noise * pipe.scheduler.init_noise_sigma
     image = pipe(
         prompt,
-        latents=xT.clone(),
+        latents=raw_noise.clone(),
         num_inference_steps=num_steps,
         guidance_scale=guidance_scale,
     ).images[0]
     image.save(out_dir / "query.png")
+    torch.save(raw_noise.detach().cpu(), out_dir / "query_noise.pt")
     torch.save(xT.detach().cpu(), out_dir / "query_xT.pt")
     return xT, image
 
@@ -195,14 +246,13 @@ def compute_concept_grad(args, pipe, prompt, neg_prompt, xT, device, dtype):
         param.requires_grad = args.layer in name
 
     proj_dim = 2**15
-    from dattri.func.projection import random_project
     from torch.func import functional_call, grad, vmap
 
-    project_func = random_project(
-        torch.randn(count_parameters(unet), device=device),
+    project_func = make_random_project_func(
         count_parameters(unet),
-        proj_max_batch_size=16,
         proj_dim=proj_dim,
+        proj_max_batch_size=16,
+        proj_type=args.proj_type,
         device=device,
     )
 
@@ -234,7 +284,7 @@ def compute_concept_grad(args, pipe, prompt, neg_prompt, xT, device, dtype):
     pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
     xT_batch = xT.repeat(args.batch_size, 1, 1, 1)
 
-    for _ in tqdm(range(args.epochs), desc="concept grad slider_seed"):
+    for _ in tqdm(range(args.epochs), desc="compute test grad"):
         with torch.no_grad():
             pipe.scheduler.set_timesteps(ddim_nfe, device=device)
             tgt_t = (ddim_nfe // args.NFE) * torch.randint(1, args.NFE, (1,)).item()
@@ -303,10 +353,9 @@ def load_reference_grads(args, task, device):
     ).to(device)
 
     loss = None
-    if args.f == "dasv1":
-        loss_dir = build_loss_dir(args.grad_dir, args.NFE)
-        task_loss_path = loss_dir / f"task_loss-{args.task_idx}.npy"
-        train_loss_paths = [loss_dir / f"train_loss-{split_idx}.npy" for split_idx in range(args.num_split)]
+    if args.f == "das":
+        task_loss_path = grad_dir / f"task_loss-{args.task_idx}.npy"
+        train_loss_paths = [grad_dir / f"train_loss-{split_idx}.npy" for split_idx in range(args.num_split)]
         task_loss = torch.from_numpy(np.memmap(task_loss_path, dtype=np.float32, mode="r", shape=(num_exemplars,))).to(device)
         train_loss = torch.cat(
             [
@@ -318,6 +367,62 @@ def load_reference_grads(args, task, device):
         loss = torch.cat([task_loss, train_loss], dim=0)
 
     return exemplar_ds, task_grad, train_grad, loss
+
+
+def memmap_matrix(path, dim):
+    path = Path(path)
+    item_size = np.dtype(np.float32).itemsize
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if path.stat().st_size % (item_size * dim) != 0:
+        raise ValueError(f"Unexpected matrix size for {path}")
+    rows = path.stat().st_size // (item_size * dim)
+    return np.memmap(path, dtype=np.float32, mode="r", shape=(rows, dim))
+
+
+def memmap_vector(path):
+    path = Path(path)
+    item_size = np.dtype(np.float32).itemsize
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if path.stat().st_size % item_size != 0:
+        raise ValueError(f"Unexpected vector size for {path}")
+    rows = path.stat().st_size // item_size
+    return np.memmap(path, dtype=np.float32, mode="r", shape=(rows,))
+
+
+def estimate_heuristic_lambda(kernel):
+    return 0.1 * kernel.diagonal().mean().item()
+
+
+def load_train_grads(args, device):
+    grad_dir = build_grad_dir(
+        args.grad_dir,
+        args.layer,
+        args.f,
+        args.NFE,
+        normalize=args.normalize,
+        ddim_inversion=args.ddim_inversion,
+        guidance_scale=args.train_guidance_scale,
+    )
+    train_grad_paths = [grad_dir / f"train_grad-{split_idx}.npy" for split_idx in range(args.num_split)]
+    train_grad = torch.cat(
+        [torch.from_numpy(memmap_matrix(train_path, 2**15)) for train_path in train_grad_paths],
+        dim=0,
+    ).to(device)
+
+    loss = None
+    if args.f == "das":
+        train_loss_paths = [grad_dir / f"train_loss-{split_idx}.npy" for split_idx in range(args.num_split)]
+        train_loss = torch.cat(
+            [torch.from_numpy(memmap_vector(loss_path)) for loss_path in train_loss_paths],
+            dim=0,
+        ).to(device)
+        if train_loss.shape[0] != train_grad.shape[0]:
+            raise ValueError("train_loss and train_grad row counts do not match")
+        loss = train_loss
+
+    return grad_dir, train_grad, loss
 
 
 def run_influence(args, out_dir, task, concept_grad, exemplar_ds, task_grad, train_grad, loss):
@@ -340,7 +445,7 @@ def run_influence(args, out_dir, task, concept_grad, exemplar_ds, task_grad, tra
     if heuristic_lamb_path.exists():
         heuristic_lamb = torch.load(heuristic_lamb_path, map_location=device)
     else:
-        heuristic_lamb = 0.1 * torch.linalg.eigh(kernel).eigenvalues.mean().item()
+        heuristic_lamb = estimate_heuristic_lambda(kernel)
         torch.save(heuristic_lamb, heuristic_lamb_path)
 
     lamb_r_list = [1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4]
@@ -439,57 +544,196 @@ def run_influence(args, out_dir, task, concept_grad, exemplar_ds, task_grad, tra
     return metrics
 
 
+def run_train_only_influence(args, out_dir, concept_grad, train_grad_dir, train_grad, loss):
+    device = concept_grad.device
+    dtype = concept_grad.dtype
+    train_ds = LAIONVisDataset(f"{args.data_dir}/laion_subset")
+
+    kernel = train_grad.T @ train_grad
+    heuristic_lamb_path = train_grad_dir / "heuristic_lamb.pt"
+    if heuristic_lamb_path.exists():
+        heuristic_lamb = torch.load(heuristic_lamb_path, map_location=device)
+    else:
+        heuristic_lamb = estimate_heuristic_lambda(kernel)
+        torch.save(heuristic_lamb, heuristic_lamb_path)
+
+    lamb_r_list = [1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4]
+    top_k_idx_list = []
+    least_k_idx_list = []
+
+    for lamb_r in tqdm(lamb_r_list, desc="qual train influence"):
+        lamb = lamb_r * heuristic_lamb
+        eye = torch.eye(kernel.shape[0], device=device, dtype=dtype)
+        kernel_inv = torch.linalg.solve(kernel + lamb * eye, eye)
+
+        proj_train_grad = (train_grad @ kernel_inv).T
+        scores = einsum(concept_grad, proj_train_grad, "i k, k j -> j")
+        if loss is not None:
+            scores = scores * loss
+
+        top_k_idx = scores.argsort(descending=True)[: args.top_k].cpu()
+        least_k_idx = scores.argsort(descending=False)[: args.top_k].cpu()
+        top_k_idx_list.append(top_k_idx)
+        least_k_idx_list.append(least_k_idx)
+
+        render_grid(
+            top_k_idx.tolist(),
+            scores.detach().cpu(),
+            None,
+            train_ds,
+            0,
+            out_dir / f"topk-lambda_{lamb_r:.1e}.jpg",
+        )
+        save_prompt_summary(
+            top_k_idx.tolist(),
+            None,
+            train_ds,
+            0,
+            out_dir / f"topk-prompts-lambda_{lamb_r:.1e}.txt",
+            "TopK",
+        )
+
+        if args.render_leastk:
+            render_grid(
+                least_k_idx.tolist(),
+                scores.detach().cpu(),
+                None,
+                train_ds,
+                0,
+                out_dir / f"leastk-lambda_{lamb_r:.1e}.jpg",
+            )
+            save_prompt_summary(
+                least_k_idx.tolist(),
+                None,
+                train_ds,
+                0,
+                out_dir / f"leastk-prompts-lambda_{lamb_r:.1e}.txt",
+                "LeastK",
+            )
+
+        del kernel_inv, proj_train_grad, scores
+        flush()
+
+    metrics = {
+        "mode": "free_query",
+        "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt or "",
+        "seed": int(args.seed),
+        "lamb_r_list": [float(x) for x in lamb_r_list],
+        "num_train": int(train_grad.shape[0]),
+        "top_k": int(args.top_k),
+    }
+    torch.save(
+        {
+            "lamb_r_list": lamb_r_list,
+            "heuristic_lamb": heuristic_lamb,
+            "top_k_idx_list": top_k_idx_list,
+            "least_k_idx_list": least_k_idx_list,
+        },
+        out_dir / "topk_list.pt",
+    )
+    with open(out_dir / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2)
+    return metrics
+
+
 def main():
     args = arg_parser()
     seed_everything(42)
+    args.f = normalize_objective_name(args.f)
 
     device = "cuda"
     dtype = torch.float16 if args.dtype == "fp16" else torch.float32
-    tasks = load_tasks(args.task_json)
-    task = tasks[args.task_idx].copy()
-    task["model_path"] = task["model_path"].replace("models", "models-ti")
-    task["synth_image_path"] = task["synth_image_path"].replace("synth", "synth-ti")
-    seed = resolve_seed(task, args.seed)
-    out_dir = build_output_dir(args, seed)
+
+    free_query = args.prompt is not None
+    if free_query:
+        if args.seed is None:
+            args.seed = 0
+        seed = args.seed
+        prompt = args.prompt
+        neg_prompt = args.negative_prompt or ""
+        out_dir = build_free_output_dir(args, seed)
+    else:
+        if args.task_idx is None:
+            raise ValueError("Either --prompt or --task_idx must be provided")
+        tasks = load_tasks(args.task_json)
+        task = tasks[args.task_idx].copy()
+        task["model_path"] = task["model_path"].replace("models", "models-ti")
+        task["synth_image_path"] = task["synth_image_path"].replace("synth", "synth-ti")
+        seed = resolve_seed(task, args.seed)
+        prompt = task["prompt"]
+        neg_prompt = args.negative_prompt
+        if neg_prompt is None:
+            neg_prompt = task["prompt"].replace("<new1> ", "")
+        out_dir = build_output_dir(args, seed)
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pipe = DiffusionPipeline.from_pretrained(args.sd_model_path).to(device, dtype=dtype)
-    pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
-    pipe.load_textual_inversion(f'{args.data_dir}/{task["model_path"]}', weight_name="new1.bin")
-    pipe.safety_checker = None
-    pipe._safety_check = False
-
-    neg_prompt = task["prompt"].replace("<new1> ", "")
-    xT, _ = generate_query_artifacts(
-        pipe,
-        task["prompt"],
-        seed,
-        device,
-        dtype,
-        out_dir,
-        args.gen_num_inference_steps,
-        args.gen_guidance_scale,
-    )
-    torch.save(
-        {
-            "task_idx": args.task_idx,
-            "seed": seed,
-            "prompt": task["prompt"],
-            "neg_prompt": neg_prompt,
-            "model_path": task["model_path"],
+    concept_grad_path = out_dir / "concept_grad.npy"
+    query_meta_path = out_dir / "query_meta.pt"
+    query_meta = {
+        "mode": "free_query" if free_query else "task",
+        "task_idx": args.task_idx,
+        "seed": seed,
+        "prompt": prompt,
+        "neg_prompt": neg_prompt,
+        "target_concept": args.target_concept,
+        "ti_model_path": args.ti_model_path if free_query else task["model_path"],
+        "concept_args": {
+            "layer": args.layer,
+            "f": args.f,
+            "NFE": args.NFE,
+            "normalize": args.normalize,
+            "ddim_inversion": args.ddim_inversion,
+            "concept_guidance_scale": args.concept_guidance_scale,
+            "eta": args.eta,
+            "proj_type": args.proj_type,
         },
-        out_dir / "query_meta.pt",
-    )
+    }
+    if (
+        concept_grad_path.exists()
+        and cache_matches(query_meta_path, query_meta)
+        and not args.force_recompute_concept_grad
+    ):
+        print(f"Loading existing concept grad: {concept_grad_path}")
+        concept_grad = torch.from_numpy(np.load(concept_grad_path)).to(device)
+    else:
+        pipe = DiffusionPipeline.from_pretrained(args.sd_model_path, torch_dtype=dtype).to(device)
+        pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
+        if free_query:
+            if args.ti_model_path is not None:
+                pipe.load_textual_inversion(args.ti_model_path, weight_name=args.ti_weight_name)
+        else:
+            pipe.load_textual_inversion(f'{args.data_dir}/{task["model_path"]}', weight_name="new1.bin")
+        pipe.safety_checker = None
+        pipe._safety_check = False
 
-    concept_grad = compute_concept_grad(args, pipe, task["prompt"], neg_prompt, xT, device, dtype)
-    np.save(out_dir / "concept_grad.npy", concept_grad.detach().cpu().numpy())
+        xT, _ = generate_query_artifacts(
+            pipe,
+            prompt,
+            seed,
+            device,
+            dtype,
+            out_dir,
+            args.gen_num_inference_steps,
+            args.gen_guidance_scale,
+        )
+        torch.save(query_meta, query_meta_path)
 
-    del pipe
-    flush()
+        concept_grad = compute_concept_grad(args, pipe, prompt, neg_prompt, xT, device, dtype)
+        np.save(concept_grad_path, concept_grad.detach().cpu().numpy())
 
-    exemplar_ds, task_grad, train_grad, loss = load_reference_grads(args, task, device)
-    concept_grad = concept_grad.to(device, dtype=train_grad.dtype)
-    metrics = run_influence(args, out_dir, task, concept_grad, exemplar_ds, task_grad, train_grad, loss)
+        del pipe
+        flush()
+
+    if free_query:
+        train_grad_dir, train_grad, loss = load_train_grads(args, device)
+        concept_grad = concept_grad.to(device, dtype=train_grad.dtype)
+        metrics = run_train_only_influence(args, out_dir, concept_grad, train_grad_dir, train_grad, loss)
+    else:
+        exemplar_ds, task_grad, train_grad, loss = load_reference_grads(args, task, device)
+        concept_grad = concept_grad.to(device, dtype=train_grad.dtype)
+        metrics = run_influence(args, out_dir, task, concept_grad, exemplar_ds, task_grad, train_grad, loss)
     print(json.dumps(metrics, indent=2))
 
 
